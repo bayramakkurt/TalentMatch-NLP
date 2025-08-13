@@ -3,10 +3,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Union
 import re
 import spacy
-import gridfs
-import pymongo
-from pymongo import MongoClient
-from bson import ObjectId
 import io
 from transformers import MT5ForConditionalGeneration, MT5Tokenizer
 import torch
@@ -14,8 +10,11 @@ import pdfplumber
 from mongodb import Database
 
 # spaCy modelini yükle
-nlp = spacy.load("tr_core_news_trf")
-db_manager = Database()
+try:
+    nlp = spacy.load("tr_core_news_trf")
+except OSError:
+    print("Türkçe spaCy modeli bulunamadı. Lütfen 'python -m spacy download tr_core_news_trf' komutunu çalıştırın.")
+    nlp = None
 
 @dataclass
 class CVInfo:
@@ -26,7 +25,6 @@ class CVInfo:
     contact_info: Dict[str, str]
     summary: str = ""
 
-
 class CVSummarizer:
     """CV özetleme sınıfı - Türkçe T5 modeli kullanır"""
     
@@ -34,31 +32,44 @@ class CVSummarizer:
         self.model_name = model_name
         self.tokenizer = None
         self.model = None
+        self.model_loaded = False
         self._load_model()
     
     def _load_model(self):
         """Modeli ve tokenizer'ı yükle"""
         try:
+            print("T5 özetleme modeli yükleniyor...")
             self.tokenizer = MT5Tokenizer.from_pretrained(self.model_name)
             self.model = MT5ForConditionalGeneration.from_pretrained(self.model_name)
             
             # GPU varsa kullan
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
+                print("Model GPU'ya yüklendi")
+            else:
+                print("Model CPU'da çalışacak")
+                
+            self.model_loaded = True
+            print("T5 modeli başarıyla yüklendi")
                 
         except Exception as e:
-            print(f"Model yükleme hatası: {e}")
+            print(f"T5 model yükleme hatası: {e}")
+            print("Basit özetleme moduna geçiliyor...")
             self.tokenizer = None
             self.model = None
+            self.model_loaded = False
     
     def summarize_cv(self, cv_text: str, max_length: int = 200, min_length: int = 50) -> str:
         """CV metnini özetle"""
-        if not self.model or not self.tokenizer:
-            return "Model yüklenemedi, özet oluşturulamadı."
+        if not self.model_loaded or not self.model or not self.tokenizer:
+            return self._simple_summarize(cv_text)
         
         try:
             # Metni temizle ve hazırla
             cleaned_text = self._prepare_text_for_summarization(cv_text)
+            
+            if len(cleaned_text.strip()) < 20:
+                return self._simple_summarize(cv_text)
             
             # Tokenize et
             inputs = self.tokenizer.encode(
@@ -69,7 +80,7 @@ class CVSummarizer:
             )
             
             # GPU'ya taşı
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and self.model.device.type == 'cuda':
                 inputs = inputs.cuda()
             
             # Özet oluştur
@@ -85,10 +96,49 @@ class CVSummarizer:
             
             # Decode et
             summary = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-            return summary.strip()
+            result_summary = summary.strip()
+            
+            # Eğer özet çok kısa veya boşsa basit özetleme kullan
+            if len(result_summary) < 20:
+                return self._simple_summarize(cv_text)
+                
+            return result_summary
             
         except Exception as e:
-            print(f"Özetleme hatası: {e}")
+            print(f"T5 özetleme hatası: {e}")
+            return self._simple_summarize(cv_text)
+    
+    def _simple_summarize(self, cv_text: str) -> str:
+        """Basit özetleme (model yüklenemezse)"""
+        try:
+            lines = cv_text.split('\n')
+            important_lines = []
+            
+            # Önemli anahtar kelimeler
+            keywords = [
+                'deneyim', 'experience', 'tecrübe', 'çalışma',
+                'eğitim', 'education', 'üniversite', 'university',
+                'beceri', 'skill', 'yetenek', 'programlama',
+                'proje', 'project', 'sertifika', 'certificate'
+            ]
+            
+            for line in lines:
+                line = line.strip()
+                if len(line) > 10 and any(keyword in line.lower() for keyword in keywords):
+                    important_lines.append(line)
+            
+            if important_lines:
+                summary = '. '.join(important_lines[:3])
+                if len(summary) > 500:
+                    summary = summary[:500] + "..."
+                return summary
+            else:
+                # Son çare olarak ilk 200 karakteri al
+                clean_text = re.sub(r'\s+', ' ', cv_text).strip()
+                return clean_text[:200] + "..." if len(clean_text) > 200 else clean_text
+                
+        except Exception as e:
+            print(f"Basit özetleme hatası: {e}")
             return "Özet oluşturulamadı."
     
     def _prepare_text_for_summarization(self, text: str) -> str:
@@ -109,7 +159,6 @@ class CVSummarizer:
         cleaned_text = ' '.join(cleaned_lines)[:2000]
         
         return cleaned_text
-    
 
 class CVExtractor:
     def __init__(self):
@@ -142,12 +191,12 @@ class CVExtractor:
             'programming', 'teknik', 'technical'
         ]
         
-        # Tarih pattern'leri (düzeltilmiş)
+        # Tarih pattern'leri
         self.date_patterns = [
             r'\d{4}[-/]\d{4}',  # 2020-2024
             r'\d{4}\s*-\s*\d{4}',  # 2020 - 2024
             r'\d{1,2}[./]\d{4}',  # 01.2020
-            r'[A-Za-z]+\s+\d{4}',  # Ocak 2020, January 2020
+            r'[A-Za-zğüşıöçĞÜŞIÖÇ]+\s+\d{4}',  # Ocak 2020, January 2020
             r'\d{4}\s*-\s*[Hh]alen',  # 2020 - Halen
             r'\d{4}\s*-\s*[Pp]resent',  # 2020 - Present
             r'\d{4}\s*-\s*[Dd]evam',  # 2020 - Devam
@@ -155,34 +204,39 @@ class CVExtractor:
         ]
 
     def extract_names(self, text: str) -> List[str]:
-        """İsim soyisim çıkarma - NER + sıkı regex ile"""
-        doc = nlp(text)
+        """İsim soyisim çıkarma - NER + regex ile"""
         names = []
-
-        # NER ile PERSON entityleri
-        for ent in doc.ents:
-            if ent.label_ == "PERSON":
-                name = ent.text.strip()
-                # En az 2 kelime ve sadece harf içeren
-                if len(name.split()) >= 2 and all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü]+", w) for w in name.split()):
-                    names.append(name)
-
-        # Başından sıkı regex ile 2-4 kelimelik isim arama
+        
+        if nlp:
+            # NER ile PERSON entityleri
+            doc = nlp(text)
+            for ent in doc.ents:
+                if ent.label_ == "PERSON":
+                    name = ent.text.strip()
+                    # En az 2 kelime ve sadece harf içeren
+                    if (len(name.split()) >= 2 and 
+                        all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü]+", w) for w in name.split())):
+                        names.append(name)
+        
+        # Başından regex ile 2-4 kelimelik isim arama
         lines = text.split('\n')[:10]
         for line in lines:
             line = line.strip()
             # Her kelime büyük harfle başlar, 2-4 kelime, sadece harflerden oluşur
-            if re.fullmatch(r'([A-ZÇĞİÖŞÜ][a-zçğıöşü]+(?:\s|$)){2,4}', line):
-                if line not in names:
-                    names.append(line)
-
+            name_pattern = r'^([A-ZÇĞİÖŞÜ][a-zçğıöşü]+(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü]+){1,3})$'
+            match = re.match(name_pattern, line)
+            if match:
+                candidate_name = match.group(1)
+                if candidate_name not in names and len(candidate_name.split()) >= 2:
+                    names.append(candidate_name)
+        
         return list(set(names))
 
     def extract_education(self, text: str) -> List[Dict[str, str]]:
-        """Eğitim bilgilerini çıkarma - yapılandırılmış parsing"""
+        """Eğitim bilgilerini çıkarma"""
         education = []
         
-        # Önce eğitim bölümlerini bul
+        # Eğitim bölümlerini bul
         education_sections = self._find_education_sections(text)
         
         for section in education_sections:
@@ -216,10 +270,9 @@ class CVExtractor:
                 section_content = []
                 j = i + 1
                 
-                while j < len(lines):
+                while j < len(lines) and len(section_content) < 15:
                     next_line = lines[j].strip()
                     
-                    # Boş satır geç
                     if not next_line:
                         j += 1
                         continue
@@ -230,10 +283,6 @@ class CVExtractor:
                     
                     section_content.append(next_line)
                     j += 1
-                    
-                    # Maksimum 15 satır al
-                    if len(section_content) >= 15:
-                        break
                 
                 if section_content:
                     sections.append('\n'.join(section_content))
@@ -278,7 +327,7 @@ class CVExtractor:
         line_lower = line.lower()
         
         # Tarih içeriyorsa büyük ihtimalle ana giriş
-        has_date = any(re.search(pattern, line) for pattern in self.date_patterns)
+        has_date = any(re.search(pattern, line, re.IGNORECASE) for pattern in self.date_patterns)
         
         # Eğitim kurumu içeriyorsa
         has_institution = bool(self._extract_institution_name(line))
@@ -292,7 +341,6 @@ class CVExtractor:
         """Bu satır eğitim detayı mı?"""
         line_lower = line.lower()
         
-        # Not ortalaması, tez konusu gibi detaylar
         detail_keywords = [
             'gpa', 'not ortalaması', 'ortalama', 'tez', 'thesis', 'proje', 'project',
             'burs', 'scholarship', 'derece', 'honor', 'onur', 'başarı', 'achievement'
@@ -304,15 +352,15 @@ class CVExtractor:
         """Tek satırlık eğitim bilgisini parse et"""
         edu_info = {}
         line_lower = line.lower()
+        original_line = line
         
         # Tarih çıkar
         for pattern in self.date_patterns:
             try:
-                dates = re.findall(pattern, line)
+                dates = re.findall(pattern, line, re.IGNORECASE)
                 if dates:
                     edu_info['dates'] = dates[0]
-                    # Tarihi çıkardıktan sonra temizle
-                    line = re.sub(pattern, '', line).strip()
+                    line = re.sub(pattern, '', line, flags=re.IGNORECASE).strip()
                     break
             except re.error:
                 continue
@@ -355,7 +403,7 @@ class CVExtractor:
             
             # Bu satırda eğitim bilgisi var mı?
             if (any(keyword in line_lower for keyword in ['üniversite', 'university', 'lise', 'college']) and
-                (any(re.search(pattern, line) for pattern in self.date_patterns) or 
+                (any(re.search(pattern, line, re.IGNORECASE) for pattern in self.date_patterns) or 
                  any(word in line_lower for word in ['lisans', 'bachelor', 'master', 'phd']))):
                 
                 edu_info = self._parse_single_education_line(line)
@@ -363,19 +411,17 @@ class CVExtractor:
         
         return education
 
-    def _extract_institution_name(self, text: str) -> str:
+    def _extract_institution_name(self, text: str) -> Optional[str]:
         """Kurum ismi çıkarma"""
-        text_lower = text.lower()
-        
         # Üniversite pattern'leri
         university_patterns = [
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*üniversitesi',  # ... Üniversitesi
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*university',    # ... University
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*üniversite',    # ... Üniversite
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*lisesi',        # ... Lisesi
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*college',       # ... College
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*institute',     # ... Institute
-            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*akademi',       # ... Akademi
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*üniversitesi',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*university',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*üniversite',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*lisesi',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*college',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*institute',
+            r'([A-ZÜĞŞIÖÇa-züğşiöç\s]+)\s*akademi',
         ]
         
         for pattern in university_patterns:
@@ -383,7 +429,6 @@ class CVExtractor:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     institution = match.group(1).strip()
-                    # En az 3 karakter olmalı
                     if len(institution) >= 3:
                         return institution
             except re.error:
@@ -391,9 +436,8 @@ class CVExtractor:
         
         return None
 
-    def _extract_department(self, text: str) -> str:
+    def _extract_department(self, text: str) -> Optional[str]:
         """Bölüm/alan çıkarma"""
-        # Yaygın bölüm isimleri
         departments = [
             'bilgisayar mühendisliği', 'computer engineering', 'computer science',
             'elektrik mühendisliği', 'electrical engineering',
@@ -419,10 +463,10 @@ class CVExtractor:
         return None
 
     def extract_experience(self, text: str) -> List[Dict[str, str]]:
-        """Deneyim ve tecrübe bilgilerini çıkarma - yapılandırılmış parsing"""
+        """Deneyim ve tecrübe bilgilerini çıkarma"""
         experience = []
         
-        # Önce deneyim bölümlerini bul
+        # Deneyim bölümlerini bul
         experience_sections = self._find_experience_sections(text)
         
         for section in experience_sections:
@@ -457,10 +501,9 @@ class CVExtractor:
                 section_content = []
                 j = i + 1
                 
-                while j < len(lines):
+                while j < len(lines) and len(section_content) < 20:
                     next_line = lines[j].strip()
                     
-                    # Boş satır geç
                     if not next_line:
                         j += 1
                         continue
@@ -471,10 +514,6 @@ class CVExtractor:
                     
                     section_content.append(next_line)
                     j += 1
-                    
-                    # Maksimum 20 satır al
-                    if len(section_content) >= 20:
-                        break
                 
                 if section_content:
                     sections.append('\n'.join(section_content))
@@ -519,7 +558,7 @@ class CVExtractor:
         line_lower = line.lower()
         
         # Tarih içeriyorsa büyük ihtimalle ana giriş
-        has_date = any(re.search(pattern, line) for pattern in self.date_patterns)
+        has_date = any(re.search(pattern, line, re.IGNORECASE) for pattern in self.date_patterns)
         
         # Pozisyon title içeriyorsa
         position_indicators = [
@@ -530,10 +569,10 @@ class CVExtractor:
         ]
         has_position = any(pos in line_lower for pos in position_indicators)
         
-        # Şirket ismi pattern'i (genelde büyük harflerle)
+        # Şirket ismi pattern'i
         has_company_pattern = bool(re.search(r'[A-ZÜĞŞIÖÇa-z][A-ZÜĞŞIÖÇa-z\s&,.-]{3,}', line))
         
-        # Çizgi (-) veya tire ile ayrılmış format (Pozisyon - Şirket)
+        # Çizgi (-) veya tire ile ayrılmış format
         has_separator = ' - ' in line or ' | ' in line
         
         return has_date or (has_position and has_company_pattern) or has_separator
@@ -569,11 +608,10 @@ class CVExtractor:
         # Tarih çıkar
         for pattern in self.date_patterns:
             try:
-                dates = re.findall(pattern, line)
+                dates = re.findall(pattern, line, re.IGNORECASE)
                 if dates:
                     exp_info['dates'] = dates[0]
-                    # Tarihi çıkardıktan sonra temizle
-                    line = re.sub(pattern, '', line).strip()
+                    line = re.sub(pattern, '', line, flags=re.IGNORECASE).strip()
                     break
             except re.error:
                 continue
@@ -614,7 +652,6 @@ class CVExtractor:
             # Pozisyon keyword'ü bul
             for keyword in position_keywords:
                 if keyword in line_lower:
-                    # Keyword'den öncesi ve sonrası
                     keyword_pos = line_lower.find(keyword)
                     before = line[:keyword_pos].strip()
                     after = line[keyword_pos:].strip()
@@ -624,7 +661,7 @@ class CVExtractor:
                         exp_info['company'] = before
                         exp_info['position'] = after
                     else:
-                        exp_info['position'] = before + ' ' + after
+                        exp_info['position'] = before + ' ' + after if before else after
                     break
             else:
                 # Ayırt edemediyse tümünü position olarak al
@@ -646,7 +683,7 @@ class CVExtractor:
             
             # Bu satırda deneyim bilgisi var mı?
             if (any(keyword in line_lower for keyword in self.experience_keywords) and
-                (any(re.search(pattern, line) for pattern in self.date_patterns) or
+                (any(re.search(pattern, line, re.IGNORECASE) for pattern in self.date_patterns) or
                  any(pos in line_lower for pos in ['manager', 'developer', 'engineer', 'analyst']))):
                 
                 exp_info = self._parse_single_experience_line(line)
@@ -670,6 +707,7 @@ class CVExtractor:
                 any(header in line_lower for header in section_headers))
 
     def extract_contact_info(self, text: str) -> Dict[str, str]:
+        """İletişim bilgilerini çıkarma"""
         contact = {}
 
         # Email
@@ -678,6 +716,7 @@ class CVExtractor:
         if emails:
             contact['email'] = emails[0]
 
+        # Telefon numaraları (Türkiye formatları)
         phone_patterns = [
             r'\+90\s*\(?\d{3}\)?\s*\d{3}\s*\d{2}\s*\d{2}',
             r'0\d{3}\s?\d{3}\s?\d{2}\s?\d{2}',
@@ -694,7 +733,7 @@ class CVExtractor:
         return contact
 
     def extract_skills(self, text: str) -> List[str]:
-        """Yetenek ve beceri bilgilerini çıkarma - dinamik skill tespiti"""
+        """Yetenek ve beceri bilgilerini çıkarma"""
         skills = []
         text_lower = text.lower()
         
@@ -761,7 +800,7 @@ class CVExtractor:
             
             # Skill başlığı kontrolü
             if any(keyword in line_lower for keyword in self.skill_keywords):
-                # Bu satırdan sonraki satırları topla (yeni bölüm başlayana kadar)
+                # Bu satırdan sonraki satırları topla
                 section_lines = []
                 for j in range(i + 1, len(lines)):
                     next_line = lines[j].strip()
@@ -804,23 +843,34 @@ class CVExtractor:
 
     def extract_cv_info(self, cv_text: str) -> CVInfo:
         """Ana fonksiyon - CV'den tüm bilgileri çıkarır"""
-        # Metni temizle
-        cv_text = re.sub(r'\s+', ' ', cv_text)  # Fazla boşlukları temizle
-        
-        # Tüm bilgileri çıkar
-        names = self.extract_names(cv_text)
-        education = self.extract_education(cv_text)
-        experience = self.extract_experience(cv_text)
-        skills = self.extract_skills(cv_text)
-        contact_info = self.extract_contact_info(cv_text)
-        
-        return CVInfo(
-            names=names,
-            education=education,
-            experience=experience,
-            skills=skills,
-            contact_info=contact_info
-        )
+        try:
+            # Metni temizle
+            cv_text = re.sub(r'\s+', ' ', cv_text)
+            
+            # Tüm bilgileri çıkar
+            names = self.extract_names(cv_text)
+            education = self.extract_education(cv_text)
+            experience = self.extract_experience(cv_text)
+            skills = self.extract_skills(cv_text)
+            contact_info = self.extract_contact_info(cv_text)
+            
+            return CVInfo(
+                names=names,
+                education=education,
+                experience=experience,
+                skills=skills,
+                contact_info=contact_info
+            )
+        except Exception as e:
+            print(f"CV bilgi çıkarma hatası: {e}")
+            # Hata durumunda boş CVInfo döndür
+            return CVInfo(
+                names=[],
+                education=[],
+                experience=[],
+                skills=[],
+                contact_info={}
+            )
 
 class EnhancedCVProcessor:
     """Ana CV işleme sınıfı - tüm işlemleri koordine eder"""
@@ -828,8 +878,8 @@ class EnhancedCVProcessor:
     def __init__(self):
         self.extractor = CVExtractor()
         self.summarizer = CVSummarizer()
+        self.db_manager = Database()
         
-    
     def pdf_to_text(self, pdf_content: bytes) -> str:
         """PDF içeriğini metne çevir (pdfplumber ile)"""
         try:
@@ -839,6 +889,10 @@ class EnhancedCVProcessor:
                     text = page.extract_text()
                     if text:
                         full_text += text + "\n"
+                
+                if not full_text.strip():
+                    raise Exception("PDF içeriği okunamadı veya boş")
+                
                 return full_text
         except Exception as e:
             raise Exception(f"PDF okuma hatası: {e}")
@@ -851,7 +905,11 @@ class EnhancedCVProcessor:
             full_text = ""
             
             for para in doc.paragraphs:
-                full_text += para.text + "\n"
+                if para.text.strip():
+                    full_text += para.text + "\n"
+            
+            if not full_text.strip():
+                raise Exception("DOC içeriği okunamadı veya boş")
             
             return full_text
         except Exception as e:
@@ -860,17 +918,13 @@ class EnhancedCVProcessor:
     def process_cv_file(self, file_content: bytes, filename: str, content_type: str = None) -> Dict[str, Any]:
         """
         Ana fonksiyon - CV dosyasını işler
-        
-        Args:
-            file_content: Dosya içeriği (bytes)
-            filename: Dosya adı
-            content_type: MIME type (isteğe bağlı)
-            
-        Returns:
-            Dict: İşlenmiş CV verileri ve metadata
         """
         
         try:
+            # Dosya içeriği kontrolü
+            if not file_content or len(file_content) == 0:
+                raise ValueError("Dosya içeriği boş")
+            
             # 1. Dosya tipini belirle
             if content_type is None:
                 if filename.lower().endswith('.pdf'):
@@ -881,7 +935,7 @@ class EnhancedCVProcessor:
                     raise ValueError("Desteklenmeyen dosya formatı. PDF veya DOC/DOCX dosyası gerekli.")
             
             # 2. Dosyayı MongoDB GridFS'e kaydet
-            file_id = db_manager.save_cv_file(file_content, filename, content_type)
+            file_id = self.db_manager.save_cv_file(file_content, filename, content_type)
             
             # 3. Dosya içeriğini metne çevir
             if 'pdf' in content_type.lower():
@@ -899,11 +953,11 @@ class EnhancedCVProcessor:
             cv_info.summary = cv_summary
             
             # 6. CV metadata'sını MongoDB'ye kaydet
-            metadata_id = db_manager.save_cv_metadata(file_id, cv_info, filename)
+            metadata_id = self.db_manager.save_cv_metadata(file_id, cv_info, filename)
             
             # 7. Sonucu döndür
             result = {
-                'file_id': file_id,
+                'file_id': str(file_id),
                 'metadata_id': metadata_id,
                 'filename': filename,
                 'content_type': content_type,
@@ -922,8 +976,13 @@ class EnhancedCVProcessor:
             return result
             
         except Exception as e:
+            print(f"CV işleme hatası: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 'status': 'error',
                 'message': f'CV işleme hatası: {str(e)}',
-                'cv_data': None
+                'cv_data': None,
+                'file_id': None,
+                'metadata_id': None
             }

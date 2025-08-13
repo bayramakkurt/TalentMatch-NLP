@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: talentmatch_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+      MONGO_INITDB_DATABASE: talentmatch
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - talentmatch_network
+
+  api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: talentmatch_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URI=mongodb://admin:password123@mongodb:27017/talentmatch?authSource=admin
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    depends_on:
+      mongodb:
+        condition: service_started
+    networks:
+      - talentmatch_network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  admin:
+    build: 
+      context: .
+      dockerfile: Dockerfile.admin
+    container_name: talentmatch_admin
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://api:8000
+    volumes:
+      - ./admin_panel.py:/app/admin_panel.py
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - talentmatch_network
+    command: streamlit run admin_panel.py --server.port 8501 --server.address 0.0.0.0
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: talentmatch_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - talentmatch_network
+    command: redis-server --appendonly yes
+
+volumes:
+  mongodb_data:
+  redis_data:
+
+networks:
+  talentmatch_network:
+    driver: bridge

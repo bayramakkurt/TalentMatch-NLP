@@ -1,17 +1,31 @@
-# Virtual environment
+# Sanal ortam
 venv/
-
-# Environment variables
 .env
 
-# Example CV folder
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Log dosyaları
+logs/
+
+# Docker
+*.pid
+docker-compose.override.yml
+docker-compose.override.*.yml
+
+# Model dosyaları (çok büyük, Git dışında tutulmalı)
+models/
+tr_core_news_trf-1.0-py3-none-any.whl
+
+# Data ve örnek CV'ler (opsiyonel)
+data/
 ornek_cv/
 
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# OS dosyaları
+.DS_Store
+Thumbs.db
 
-# VSCode settings (opsiyonel)
-.vscode/
+# Temporary files
+*.tmp
+*.swp

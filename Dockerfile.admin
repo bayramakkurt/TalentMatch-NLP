@@ -1,0 +1,44 @@
+FROM python:3.10-slim
+
+# Sistem bağımlılıklarını yükle
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Streamlit ve gerekli paketleri yükle
+RUN pip install --no-cache-dir \
+    streamlit==1.28.1 \
+    requests==2.32.4 \
+    pandas==2.3.1
+
+# Admin panel dosyasını kopyala
+COPY admin_panel.py .
+
+# Streamlit config
+RUN mkdir -p ~/.streamlit
+RUN echo "\
+[server]\n\
+port = 8501\n\
+address = '0.0.0.0'\n\
+headless = true\n\
+enableCORS = false\n\
+enableXsrfProtection = false\n\
+\n\
+[theme]\n\
+primaryColor = '#FF6B6B'\n\
+backgroundColor = '#FFFFFF'\n\
+secondaryBackgroundColor = '#F0F2F6'\n\
+textColor = '#262730'\n\
+" > ~/.streamlit/config.toml
+
+# Port 8501'i aç
+EXPOSE 8501
+
+# Sağlık kontrolü
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
+# Uygulamayı başlat
+CMD ["streamlit", "run", "admin_panel.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
